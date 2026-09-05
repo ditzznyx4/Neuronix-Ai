@@ -201,6 +201,75 @@ const REASONING_EFFORT = {
 };
 
 /* ============================================================
+ * 2c) KECEPATAN BERPIKIR per model — dikalikan ke thinkingBudgetTokens
+ *     dari REASONING_SAFETY, jadi Lumen selalu lebih cepat daripada
+ *     Flux walau Penalaran-nya sama, dan Max selalu lebih lama
+ *     daripada Rendah walau model-nya sama. Kombinasi keduanya yang
+ *     nentuin berapa lama proses berpikir beneran berjalan (real-time,
+ *     bukan animasi pura-pura).
+ * ============================================================ */
+const MODEL_SPEED_FACTOR = {
+  'Lumen 4.0': 0.35,
+  'Lumen 4.5': 0.55,
+  'Solis 4.8': 0.9,
+  'Solis 5': 1.3,
+  'Flux 5.5': 1.7,
+};
+
+// 'adjustable' = pengguna BOLEH minta pemikiran dipercepat/dihemat, model
+//   beneran nurut (Lumen & Solis 4.8 — cocok buat obrolan cepat sehari-hari).
+// 'locked'     = pengguna TIDAK BISA memaksa memperpendek penalaran lewat
+//   instruksi di prompt (Solis 5 & Flux 5.5) — supaya prompt injection tidak
+//   bisa melemahkan proses berpikir/keamanan model di tier paling capable.
+const MODEL_TIER_GROUP = {
+  'Lumen 4.0': 'adjustable',
+  'Lumen 4.5': 'adjustable',
+  'Solis 4.8': 'adjustable',
+  'Solis 5': 'locked',
+  'Flux 5.5': 'locked',
+};
+
+/* ============================================================
+ * 2d) Instruksi format proses berpikir — dipakai model buat menyusun
+ *     reasoning-nya jadi tahapan: input → thinking → identified →
+ *     analisis → verified. Frontend mem-parsing label ini buat nyusun
+ *     tampilan "Ringkasan pemikiran" secara bertahap.
+ * ============================================================ */
+const REASONING_STAGE_INSTRUCTION = `
+FORMAT PROSES BERPIKIR (dipakai di bagian reasoning/thinking, BUKAN di jawaban akhir):
+Strukturkan proses berpikirmu memakai label singkat di awal tiap bagian, berurutan:
+[INPUT] ringkasan singkat apa yang kamu pahami dari permintaan pengguna.
+[THINKING] proses berpikir umum / eksplorasi pendekatan yang mungkin.
+[IDENTIFIED] inti masalah, kebutuhan, atau batasan yang teridentifikasi.
+[ANALISIS] analisis lebih dalam: pertimbangan, perhitungan, atau perbandingan opsi.
+[VERIFIED] verifikasi akhir sebelum menjawab (cek konsistensi, fakta, dan keamanan).
+Setelah semua tahap itu barulah tulis jawaban akhir (di luar bagian reasoning).
+`.trim();
+
+/* ============================================================
+ * 2e) Deteksi upaya user memaksa pemikiran jadi lebih pendek/cepat
+ *     lewat instruksi di prompt. Sama seperti detectJailbreakSignals:
+ *     MENANDAI, bukan langsung menolak — tapi hasilnya beda perlakuan
+ *     tergantung MODEL_TIER_GROUP (lihat handler di bawah).
+ * ============================================================ */
+function detectEfficiencyOverrideAttempt(text) {
+  const signals = [];
+  const lowered = text.toLowerCase();
+  const patterns = [
+    { re: /hemat token/i, label: 'save-tokens' },
+    { re: /(pikir|berpikir|mikir)(?:lah)? (?:yang )?cepat/i, label: 'think-fast' },
+    { re: /jangan (?:mikir|berpikir)(?: yang)? (?:lama|panjang|dalam)/i, label: 'no-long-thinking' },
+    { re: /efisien(?:kan)? (?:pemikiran|penalaran|token|reasoning)/i, label: 'efficiency-request' },
+    { re: /skip(?:lah)? (?:thinking|reasoning|pemikiran|penalaran)/i, label: 'skip-thinking' },
+    { re: /tanpa (?:mikir|berpikir|reasoning|penalaran)/i, label: 'no-thinking' },
+    { re: /reasoning\s*(?:effort)?\s*(?:rendah|minimal|low)/i, label: 'force-low-effort' },
+    { re: /langsung (?:jawab|balas) saja(?:,)? (?:tanpa|jangan) (?:mikir|berpikir)/i, label: 'answer-without-thinking' },
+  ];
+  for (const p of patterns) if (p.re.test(lowered)) signals.push(p.label);
+  return signals; // dipakai untuk MENANDAI, perlakuan beda per tier di handler
+}
+
+/* ============================================================
  * 2b) OPENROUTER — model murah yang cocok per tier (dicek Sep 2026)
  *     Harga OpenRouter bisa berubah & beda-beda per provider yang dipilih
  *     router-nya secara otomatis — selalu cek ulang di openrouter.ai/models
@@ -231,16 +300,53 @@ const OPENROUTER_MODELS = {
 
 
 /* ============================================================
- * 3) Panggil OpenRouter beneran (fallback ke demo kalau key/model id belum siap)
+ * 3) STREAMING — panggil OpenRouter dengan reasoning tokens real-time.
+ *    Protokol ke frontend: NDJSON (satu baris = satu event JSON):
+ *      {"type":"meta", ...}       sekali di awal
+ *      {"type":"reasoning","delta":"..."}   berkali-kali (token pemikiran)
+ *      {"type":"content","delta":"..."}     berkali-kali (token jawaban)
+ *      {"type":"done"}           sekali di akhir
+ *      {"type":"error","message":"..."}     kalau gagal
  * ============================================================ */
-async function callModelProvider({ userMessage, model, reasoning, thinkingEnabled, webSearchEnabled, history }) {
-  const systemPrompt = buildSystemPrompt(reasoning); // system prompt + lapisan keamanan sesuai tier Penalaran
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+async function streamChatResponse({ res, userMessage, model, reasoning, thinkingEnabled, webSearchEnabled, history }) {
+  const send = (obj) => res.write(JSON.stringify(obj) + '\n');
+
+  const tier = MODEL_TIER_GROUP[model] || 'adjustable';
+  const speedFactor = MODEL_SPEED_FACTOR[model] || 1;
+  const baseBudget = (REASONING_SAFETY[reasoning] || REASONING_SAFETY['Sedang']).thinkingBudgetTokens;
+  let effectiveBudget = Math.round(baseBudget * speedFactor);
+
+  const overrideSignals = detectEfficiencyOverrideAttempt(userMessage);
+  let reasoningNote = null;
+  let overrideApplied = false;
+
+  if (overrideSignals.length) {
+    if (tier === 'adjustable') {
+      // Lumen & Solis 4.8: beneran dipercepat, model ikut hemat token.
+      effectiveBudget = Math.max(128, Math.round(REASONING_SAFETY['Rendah'].thinkingBudgetTokens * speedFactor));
+      overrideApplied = true;
+      reasoningNote = 'Penalaran dipercepat & dihemat sesuai permintaan Anda untuk model ini.';
+    } else {
+      // Solis 5 & Flux 5.5: TIDAK dipersingkat — anggaran tetap penuh.
+      reasoningNote = 'Permintaan untuk mempercepat/melewati proses berpikir terdeteksi. Pada model ' + model +
+        ', kedalaman penalaran tidak dapat dipaksa dipersingkat lewat instruksi pengguna — ini untuk mencegah ' +
+        'manipulasi/prompt injection terhadap proses berpikir model. Penalaran tetap dijalankan penuh sesuai ' +
+        'tingkat "' + reasoning + '" yang aktif.';
+    }
+  }
+
+  send({ type: 'meta', reasoningNote, overrideApplied, tier, model, reasoning });
+
   const openrouterModelId = OPENROUTER_MODELS[model];
   const apiKey = process.env.OPENROUTER_API_KEY;
   const modelIdReady = openrouterModelId && !openrouterModelId.startsWith('PUT_OPENROUTER');
 
   if (apiKey && modelIdReady) {
-    const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+    const structuredSystemPrompt = buildSystemPrompt(reasoning) + '\n\n' + REASONING_STAGE_INSTRUCTION;
+
+    const upstream = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -251,32 +357,79 @@ async function callModelProvider({ userMessage, model, reasoning, thinkingEnable
       body: JSON.stringify({
         model: openrouterModelId,
         max_tokens: MODELS[model]?.maxTokens || 2048,
+        stream: true,
+        reasoning: thinkingEnabled
+          ? { max_tokens: effectiveBudget, exclude: false }
+          : { enabled: false, exclude: true },
         messages: [
-          { role: 'system', content: systemPrompt },
+          { role: 'system', content: structuredSystemPrompt },
           ...(Array.isArray(history) ? history : []),
           { role: 'user', content: userMessage },
         ],
       }),
     });
 
-    if (!res.ok) {
-      const errText = await res.text().catch(() => '');
-      throw new Error(`OpenRouter error ${res.status}: ${errText}`);
+    if (!upstream.ok || !upstream.body) {
+      const errText = await upstream.text().catch(() => '');
+      send({ type: 'error', message: `OpenRouter error ${upstream.status}: ${errText}` });
+      return;
     }
 
-    const data = await res.json();
-    const replyText = data.choices?.[0]?.message?.content || '(Model tidak mengembalikan balasan.)';
-    return {
-      thinking: thinkingEnabled ? 'Diproses oleh model sungguhan via OpenRouter.' : null,
-      reply: replyText,
-    };
+    const reader = upstream.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop(); // sisa baris belum lengkap, simpan buat putaran berikutnya
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('data:')) continue;
+        const payload = trimmed.slice(5).trim();
+        if (!payload || payload === '[DONE]') continue;
+
+        let json;
+        try { json = JSON.parse(payload); } catch (e) { continue; }
+
+        const delta = json.choices?.[0]?.delta || {};
+        const reasoningPiece = delta.reasoning ?? delta.reasoning_content;
+        if (reasoningPiece) send({ type: 'reasoning', delta: reasoningPiece });
+        if (delta.content) send({ type: 'content', delta: delta.content });
+      }
+    }
+
+    send({ type: 'done' });
+    return;
   }
 
-  // Jalur DEMO (fallback) — dipakai selama OPENROUTER_MODELS / OPENROUTER_API_KEY belum diisi.
-  return {
-    thinking: thinkingEnabled ? 'Menguraikan permintaan pengguna dan menyusun jawaban yang relevan.' : null,
-    reply: `(demo) Balasan dari ${model} — set env OPENROUTER_API_KEY di Vercel untuk pakai model sungguhan. [tier keamanan: ${REASONING_SAFETY[reasoning]?.label || 'Standar'}]`,
-  };
+  // ---------- Jalur DEMO (fallback) — disimulasikan lewat protokol yang sama,
+  // termasuk kecepatan per model+Penalaran, supaya perilaku UI identik dengan
+  // jalur sungguhan begitu OPENROUTER_API_KEY diisi. ----------
+  const tickMs = Math.max(4, Math.round(9 * speedFactor));
+  const demoReasoning =
+    `[INPUT] Memahami permintaan: "${userMessage}".\n` +
+    `[THINKING] Mode demo aktif (OPENROUTER_API_KEY/model id belum siap) — mensimulasikan kecepatan ${model}.\n` +
+    `[IDENTIFIED] Perlu balasan contoh untuk menguji tampilan streaming & pipeline pemikiran.\n` +
+    `[ANALISIS] Menyusun teks demo singkat sesuai tingkat Penalaran ${reasoning}.\n` +
+    `[VERIFIED] Format & struktur tahapan sudah sesuai sebelum dikirim sebagai jawaban.`;
+  const demoReply = `(demo) Balasan dari **${model}**. Set \`OPENROUTER_API_KEY\` di Vercel untuk jawaban sungguhan.` +
+    (reasoningNote ? `\n\n> _Catatan: ${reasoningNote}_` : '');
+
+  if (thinkingEnabled) {
+    for (const ch of demoReasoning) {
+      send({ type: 'reasoning', delta: ch });
+      await sleep(tickMs);
+    }
+  }
+  for (const ch of demoReply) {
+    send({ type: 'content', delta: ch });
+    await sleep(Math.max(3, Math.round(tickMs * 0.6)));
+  }
+  send({ type: 'done' });
 }
 
 /* ============================================================
@@ -314,8 +467,15 @@ module.exports = async (req, res) => {
     console.warn('[system_warning] Pola mencurigakan terdeteksi:', signals);
   }
 
+  res.writeHead(200, {
+    'Content-Type': 'application/x-ndjson; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    'X-Accel-Buffering': 'no',
+  });
+
   try {
-    const result = await callModelProvider({
+    await streamChatResponse({
+      res,
       userMessage: message,
       model: model || 'Solis 4.8',
       reasoning: reasoning || 'Sedang',
@@ -323,9 +483,9 @@ module.exports = async (req, res) => {
       webSearchEnabled: !!webSearchEnabled,
       history: Array.isArray(history) ? history : [],
     });
-    return res.status(200).json(result);
   } catch (err) {
     console.error(err);
-    return res.status(500).json({ error: 'Gagal menghasilkan balasan dari OpenRouter: ' + err.message });
+    try { res.write(JSON.stringify({ type: 'error', message: 'Gagal menghasilkan balasan: ' + err.message }) + '\n'); } catch (e) {}
   }
+  res.end();
 };
