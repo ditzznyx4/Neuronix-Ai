@@ -209,13 +209,26 @@ const REASONING_EFFORT = {
  *     mis. 'meta-llama/llama-3.1-8b-instruct' atau 'openai/gpt-4o-mini'.
  * ============================================================ */
 const OPENROUTER_MODELS = {
-  'Lumen 4.0': 'PUT_OPENROUTER_MODEL_ID_HERE',
-  'Lumen 4.5': 'PUT_OPENROUTER_MODEL_ID_HERE',
-  'Solis 4.8': 'PUT_OPENROUTER_MODEL_ID_HERE',
-  'Solis 5':   'PUT_OPENROUTER_MODEL_ID_HERE',
-  'Flux 5.5':  'PUT_OPENROUTER_MODEL_ID_HERE',
-};
+  // Termurah & tercepat — cocok buat chat ringan sehari-hari.
+  // DeepSeek V4 Flash — ±$0.14 / $0.28 per 1M token (in/out).
+  'Lumen 4.0': 'deepseek/deepseek-v4-flash',
 
+  // Masih murah, kualitas naik satu tingkat.
+  // Qwen3 235B A22B (non-thinking) — ±$0.09–0.23 / $0.55–2.30 per 1M.
+  'Lumen 4.5': 'qwen/qwen3-235b-a22b-2507',
+
+  // Seimbang — konteks 1M token, kualitas kuat, masih murah.
+  // DeepSeek V4 Pro — ±$0.43 / $0.87 per 1M.
+  'Solis 4.8': 'deepseek/deepseek-v4-pro',
+
+  // Versi "thinking" dari Qwen3 235B — cocok dipasangkan dengan toggle
+  // Pemikiran di UI. ±$0.11–0.23 / $0.60–2.30 per 1M.
+  'Solis 5': 'qwen/qwen3-235b-a22b-thinking-2507',
+
+  // Paling capable dari kelompok ini, reasoning model native —
+  // pas untuk tier "Max". Kimi K2 Thinking — ±$0.60 / $2.50 per 1M.
+  'Flux 5.5': 'moonshotai/kimi-k2-thinking',
+};
 /* ============================================================
  * 3) STUB — panggilan ke provider model sungguhan
  *    Ganti isi fungsi ini saat sudah punya API key / endpoint model.
