@@ -1,19 +1,16 @@
 /**
- * Neuronix AI — main.js
+ * Neuronix AI — api/main.js
  * -----------------------------------------------------------------
- * Ini adalah SCAFFOLD BACKEND (bukan script browser).
- * File ini ditujukan untuk dijalankan di server (mis. Node.js + Express),
- * bukan di-load langsung oleh index.html — karena UI saat ini masih
- * memakai balasan demo (lihat <script> di dalam neuronix_chat.html).
+ * SATU FILE untuk semuanya: system prompt, konfigurasi model,
+ * pemanggilan OpenRouter, deteksi jailbreak ringan, DAN handler-nya.
+ * Ditaruh di folder /api supaya Vercel otomatis jadiin ini endpoint
+ * serverless di POST /api/main — gak perlu file wrapper lain.
  *
- * Saat kamu siap menyambungkan ke model sungguhan:
- *   1. npm init -y && npm install express cors
- *   2. Ganti fungsi callModelProvider() di bawah dengan panggilan asli
- *      ke provider LLM kamu (mis. fetch ke API model Lumen/Solis/Flux).
- *   3. Jalankan: node main.js
- *   4. Di frontend, ganti fungsi appendAssistantReply() (di html) supaya
- *      fetch('/api/chat', { method:'POST', body: JSON.stringify({...}) })
- *      lalu render hasil dari sini, bukan balasan demo statis.
+ * Cara pakai:
+ *   1. Set environment variable OPENROUTER_API_KEY di Vercel.
+ *   2. Selesai — semua slug model di OPENROUTER_MODELS di bawah
+ *      udah diisi, jadi otomatis aktif begitu key-nya ke-set.
+ *   3. Frontend (neuronix_chat.html) manggil fetch('/api/main', ...).
  * -----------------------------------------------------------------
  */
 
@@ -204,9 +201,11 @@ const REASONING_EFFORT = {
 };
 
 /* ============================================================
- * 2b) OPENROUTER — taruh model ID OpenRouter kamu di sini
- *     Cari slug model di https://openrouter.ai/models lalu tempel di bawah,
- *     mis. 'meta-llama/llama-3.1-8b-instruct' atau 'openai/gpt-4o-mini'.
+ * 2b) OPENROUTER — model murah yang cocok per tier (dicek Sep 2026)
+ *     Harga OpenRouter bisa berubah & beda-beda per provider yang dipilih
+ *     router-nya secara otomatis — selalu cek ulang di openrouter.ai/models
+ *     sebelum dipakai di production. Semua slug di bawah format resminya:
+ *     "vendor/nama-model".
  * ============================================================ */
 const OPENROUTER_MODELS = {
   // Termurah & tercepat — cocok buat chat ringan sehari-hari.
@@ -229,9 +228,10 @@ const OPENROUTER_MODELS = {
   // pas untuk tier "Max". Kimi K2 Thinking — ±$0.60 / $2.50 per 1M.
   'Flux 5.5': 'moonshotai/kimi-k2-thinking',
 };
+
+
 /* ============================================================
- * 3) STUB — panggilan ke provider model sungguhan
- *    Ganti isi fungsi ini saat sudah punya API key / endpoint model.
+ * 3) Panggil OpenRouter beneran (fallback ke demo kalau key/model id belum siap)
  * ============================================================ */
 async function callModelProvider({ userMessage, model, reasoning, thinkingEnabled, webSearchEnabled, history }) {
   const systemPrompt = buildSystemPrompt(reasoning); // system prompt + lapisan keamanan sesuai tier Penalaran
@@ -240,13 +240,12 @@ async function callModelProvider({ userMessage, model, reasoning, thinkingEnable
   const modelIdReady = openrouterModelId && !openrouterModelId.startsWith('PUT_OPENROUTER');
 
   if (apiKey && modelIdReady) {
-    // Jalur SUNGGUHAN — aktif otomatis begitu OPENROUTER_API_KEY & model id sudah diisi.
     const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${apiKey}`,
-        'HTTP-Referer': 'https://neuronix.local', // ganti dengan domain kamu bila sudah live
+        'HTTP-Referer': 'https://neuronix.local',
         'X-Title': 'Neuronix AI',
       },
       body: JSON.stringify({
@@ -276,7 +275,7 @@ async function callModelProvider({ userMessage, model, reasoning, thinkingEnable
   // Jalur DEMO (fallback) — dipakai selama OPENROUTER_MODELS / OPENROUTER_API_KEY belum diisi.
   return {
     thinking: thinkingEnabled ? 'Menguraikan permintaan pengguna dan menyusun jawaban yang relevan.' : null,
-    reply: `(demo) Balasan dari ${model} — isi OPENROUTER_MODELS & set env OPENROUTER_API_KEY di main.js untuk pakai model sungguhan. [tier keamanan: ${REASONING_SAFETY[reasoning]?.label || 'Standar'}]`,
+    reply: `(demo) Balasan dari ${model} — set env OPENROUTER_API_KEY di Vercel untuk pakai model sungguhan. [tier keamanan: ${REASONING_SAFETY[reasoning]?.label || 'Standar'}]`,
   };
 }
 
@@ -297,65 +296,36 @@ function detectJailbreakSignals(text) {
 }
 
 /* ============================================================
- * 5) CONTOH SERVER (opsional) — aktifkan dengan: npm install express cors
+ * 5) HANDLER — ini yang dipanggil Vercel di POST /api/main
  * ============================================================ */
-function startExampleServer() {
-  let express, cors;
-  try {
-    express = require('express');
-    cors = require('cors');
-  } catch (e) {
-    console.log('Jalankan "npm install express cors" dulu untuk memakai contoh server ini.');
-    return;
+module.exports = async (req, res) => {
+  if (req.method !== 'POST') {
+    res.setHeader('Allow', 'POST');
+    return res.status(405).json({ error: 'Gunakan method POST.' });
   }
 
-  const app = express();
-  app.use(cors());
-  app.use(express.json());
+  const { message, model, reasoning, thinkingEnabled, webSearchEnabled, history } = req.body || {};
+  if (!message || typeof message !== 'string') {
+    return res.status(400).json({ error: 'Field "message" wajib diisi.' });
+  }
 
-  app.post('/api/chat', async (req, res) => {
-    const { message, model, reasoning, thinkingEnabled, webSearchEnabled, history } = req.body || {};
-    if (!message || typeof message !== 'string') {
-      return res.status(400).json({ error: 'Field "message" wajib diisi.' });
-    }
+  const signals = detectJailbreakSignals(message);
+  if (signals.length) {
+    console.warn('[system_warning] Pola mencurigakan terdeteksi:', signals);
+  }
 
-    const signals = detectJailbreakSignals(message);
-    if (signals.length) {
-      console.warn('[system_warning] Pola mencurigakan terdeteksi:', signals);
-      // Tidak diblokir otomatis — hanya dicatat/ditandai agar bisa dipantau.
-    }
-
-    try {
-      const result = await callModelProvider({
-        userMessage: message,
-        model: model || 'Solis 4.8',
-        reasoning: reasoning || 'Sedang',
-        thinkingEnabled: thinkingEnabled !== false,
-        webSearchEnabled: !!webSearchEnabled,
-        history: Array.isArray(history) ? history : [],
-      });
-      res.json(result);
-    } catch (err) {
-      console.error(err);
-      res.status(500).json({ error: 'Gagal menghasilkan balasan.' });
-    }
-  });
-
-  const PORT = process.env.PORT || 3001;
-  app.listen(PORT, () => console.log(`Neuronix AI backend jalan di http://localhost:${PORT}`));
-}
-
-if (require.main === module) {
-  startExampleServer();
-}
-
-module.exports = {
-  SYSTEM_PROMPT,
-  REASONING_SAFETY,
-  buildSystemPrompt,
-  MODELS,
-  REASONING_EFFORT,
-  OPENROUTER_MODELS,
-  callModelProvider,
-  detectJailbreakSignals,
+  try {
+    const result = await callModelProvider({
+      userMessage: message,
+      model: model || 'Solis 4.8',
+      reasoning: reasoning || 'Sedang',
+      thinkingEnabled: thinkingEnabled !== false,
+      webSearchEnabled: !!webSearchEnabled,
+      history: Array.isArray(history) ? history : [],
+    });
+    return res.status(200).json(result);
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: 'Gagal menghasilkan balasan dari OpenRouter: ' + err.message });
+  }
 };
