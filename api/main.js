@@ -238,12 +238,12 @@ const MODEL_TIER_GROUP = {
 const REASONING_STAGE_INSTRUCTION = `
 FORMAT PROSES BERPIKIR (dipakai di bagian reasoning/thinking, BUKAN di jawaban akhir):
 Strukturkan proses berpikirmu memakai label singkat di awal tiap bagian, berurutan:
-[INPUT] ringkasan singkat apa yang kamu pahami dari permintaan pengguna.
-[THINKING] proses berpikir umum / eksplorasi pendekatan yang mungkin.
-[IDENTIFIED] inti masalah, kebutuhan, atau batasan yang teridentifikasi.
-[ANALISIS] analisis lebih dalam: pertimbangan, perhitungan, atau perbandingan opsi.
-[VERIFIED] verifikasi akhir sebelum menjawab (cek konsistensi, fakta, dan keamanan).
-Setelah semua tahap itu barulah tulis jawaban akhir (di luar bagian reasoning).
+[IDENTIFY] identifikasi inti permintaan pengguna, kebutuhan sebenarnya, dan batasan yang relevan.
+[DECOMPOSE] uraikan masalah jadi bagian/langkah yang lebih kecil dan lebih mudah dikerjakan.
+[ANALYSIS] analisis tiap bagian: pertimbangan, perhitungan, perbandingan opsi, kemungkinan pendekatan.
+[VERIFY] verifikasi temuan/analisis di atas — cek konsistensi, fakta, logika, dan keamanan.
+[SYNTHESIZE] gabungkan semua hasil verifikasi jadi satu kesimpulan yang koheren.
+Setelah semua tahap itu barulah tulis jawaban akhir/output (di luar bagian reasoning).
 `.trim();
 
 /* ============================================================
@@ -298,6 +298,11 @@ const OPENROUTER_MODELS = {
   'Flux 5.5': 'moonshotai/kimi-k2-thinking',
 };
 
+// Model vision — dipakai otomatis begitu ada lampiran gambar,
+// terlepas dari model teks yang lagi dipilih di UI (Lumen/Solis/Flux
+// belum tentu semuanya bisa "lihat" gambar).
+const OPENROUTER_VISION_MODEL = 'deepseek/deepseek-v4-flash-vision-exp';
+
 
 /* ============================================================
  * 3) STREAMING — panggil OpenRouter dengan reasoning tokens real-time.
@@ -310,7 +315,7 @@ const OPENROUTER_MODELS = {
  * ============================================================ */
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
-async function streamChatResponse({ res, userMessage, model, reasoning, thinkingEnabled, webSearchEnabled, history }) {
+async function streamChatResponse({ res, userMessage, model, reasoning, thinkingEnabled, webSearchEnabled, history, image, projectInstruction }) {
   const send = (obj) => res.write(JSON.stringify(obj) + '\n');
 
   const tier = MODEL_TIER_GROUP[model] || 'adjustable';
@@ -337,14 +342,23 @@ async function streamChatResponse({ res, userMessage, model, reasoning, thinking
     }
   }
 
-  send({ type: 'meta', reasoningNote, overrideApplied, tier, model, reasoning });
+  const usingVision = !!image;
+  const effectiveModel = usingVision ? 'Vision (otomatis)' : model;
+  send({ type: 'meta', reasoningNote, overrideApplied, tier, model: effectiveModel, reasoning, usingVision });
 
-  const openrouterModelId = OPENROUTER_MODELS[model];
-  const apiKey = process.env.OPENROUTER_API_KEY;
-  const modelIdReady = openrouterModelId && !openrouterModelId.startsWith('PUT_OPENROUTER');
+  // ---------- Jalur VISION — gambar dilampirkan, paksa pakai model vision ----------
+  if (usingVision) {
+    const apiKey = process.env.OPENROUTER_API_KEY;
+    if (!apiKey) {
+      send({ type: 'content', delta: '(demo) Lampiran gambar diterima, tapi OPENROUTER_API_KEY belum diset — set dulu di Vercel supaya gambar benar-benar dianalisis.' });
+      send({ type: 'done' });
+      return;
+    }
 
-  if (apiKey && modelIdReady) {
-    const structuredSystemPrompt = buildSystemPrompt(reasoning) + '\n\n' + REASONING_STAGE_INSTRUCTION;
+    let systemPrompt = buildSystemPrompt(reasoning);
+    if (projectInstruction) {
+      systemPrompt += `\n\n[INSTRUKSI PROYEK — WAJIB DIIKUTI UNTUK SELURUH PERCAKAPAN INI]\n${projectInstruction}`;
+    }
 
     const upstream = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
@@ -355,27 +369,30 @@ async function streamChatResponse({ res, userMessage, model, reasoning, thinking
         'X-Title': 'Neuronix AI',
       },
       body: JSON.stringify({
-        model: openrouterModelId,
+        model: OPENROUTER_VISION_MODEL,
         max_tokens: MODELS[model]?.maxTokens || 2048,
         stream: true,
-        reasoning: thinkingEnabled
-          ? { max_tokens: effectiveBudget, exclude: false }
-          : { enabled: false, exclude: true },
         messages: [
-          { role: 'system', content: structuredSystemPrompt },
+          { role: 'system', content: systemPrompt },
           ...(Array.isArray(history) ? history : []),
-          { role: 'user', content: userMessage },
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: userMessage || 'Tolong jelaskan isi gambar/file ini.' },
+              { type: 'image_url', image_url: { url: image } },
+            ],
+          },
         ],
       }),
     });
 
     if (!upstream.ok || !upstream.body) {
       const errText = await upstream.text().catch(() => '');
-      send({ type: 'error', message: `OpenRouter error ${upstream.status}: ${errText}` });
+      send({ type: 'error', message: `OpenRouter (vision) error ${upstream.status}: ${errText}` });
       return;
     }
 
-    const reader = upstream.body.getReader();
+   const reader = upstream.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
 
@@ -411,12 +428,13 @@ async function streamChatResponse({ res, userMessage, model, reasoning, thinking
   // jalur sungguhan begitu OPENROUTER_API_KEY diisi. ----------
   const tickMs = Math.max(4, Math.round(9 * speedFactor));
   const demoReasoning =
-    `[INPUT] Memahami permintaan: "${userMessage}".\n` +
-    `[THINKING] Mode demo aktif (OPENROUTER_API_KEY/model id belum siap) — mensimulasikan kecepatan ${model}.\n` +
-    `[IDENTIFIED] Perlu balasan contoh untuk menguji tampilan streaming & pipeline pemikiran.\n` +
-    `[ANALISIS] Menyusun teks demo singkat sesuai tingkat Penalaran ${reasoning}.\n` +
-    `[VERIFIED] Format & struktur tahapan sudah sesuai sebelum dikirim sebagai jawaban.`;
+    `[IDENTIFY] Memahami inti permintaan: "${userMessage}".${projectInstruction ? ' Ada instruksi proyek aktif yang harus diikuti.' : ''}\n` +
+    `[DECOMPOSE] Mode demo aktif (OPENROUTER_API_KEY/model id belum siap) — memecah simulasi kecepatan ${model}.\n` +
+    `[ANALYSIS] Menyusun teks demo singkat sesuai tingkat Penalaran ${reasoning}.\n` +
+    `[VERIFY] Mengecek format & struktur tahapan sebelum lanjut.\n` +
+    `[SYNTHESIZE] Menggabungkan semua langkah di atas jadi satu jawaban akhir.`;
   const demoReply = `(demo) Balasan dari **${model}**. Set \`OPENROUTER_API_KEY\` di Vercel untuk jawaban sungguhan.` +
+    (projectInstruction ? `\n\n> _Instruksi proyek aktif: ${projectInstruction}_` : '') +
     (reasoningNote ? `\n\n> _Catatan: ${reasoningNote}_` : '');
 
   if (thinkingEnabled) {
@@ -430,6 +448,44 @@ async function streamChatResponse({ res, userMessage, model, reasoning, thinking
     await sleep(Math.max(3, Math.round(tickMs * 0.6)));
   }
   send({ type: 'done' });
+}
+
+/* ============================================================
+ * 3b) Judul obrolan otomatis — dibuat oleh AI dari pesan pertama,
+ *     bukan sekadar memotong teks input pengguna apa adanya.
+ * ============================================================ */
+async function generateChatTitle({ userMessage, model }) {
+  const fallback = (userMessage || 'Obrolan baru').replace(/\s+/g, ' ').trim().split(' ').slice(0, 5).join(' ');
+  const apiKey = process.env.OPENROUTER_API_KEY;
+  const openrouterModelId = OPENROUTER_MODELS[model] || OPENROUTER_MODELS['Solis 4.8'];
+  if (!apiKey || !openrouterModelId || openrouterModelId.startsWith('PUT_OPENROUTER')) {
+    return fallback;
+  }
+  try {
+    const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+        'HTTP-Referer': 'https://neuronix.local',
+        'X-Title': 'Neuronix AI',
+      },
+      body: JSON.stringify({
+        model: openrouterModelId,
+        max_tokens: 20,
+        messages: [
+          { role: 'system', content: 'Buat judul singkat (maksimal 5 kata, tanpa tanda kutip, tanpa titik di akhir) yang merangkum topik percakapan berikut. Balas HANYA dengan judulnya.' },
+          { role: 'user', content: userMessage },
+        ],
+      }),
+    });
+    if (!res.ok) return fallback;
+    const data = await res.json();
+    const title = data.choices?.[0]?.message?.content?.trim().replace(/^["']|["']$/g, '');
+    return title || fallback;
+  } catch (e) {
+    return fallback;
+  }
 }
 
 /* ============================================================
@@ -457,7 +513,23 @@ module.exports = async (req, res) => {
     return res.status(405).json({ error: 'Gunakan method POST.' });
   }
 
-  const { message, model, reasoning, thinkingEnabled, webSearchEnabled, history } = req.body || {};
+  const body = req.body || {};
+
+  // ---------- Aksi terpisah: minta judul obrolan (dipanggil sekali setelah balasan pertama) ----------
+  if (body.action === 'title') {
+    const { message, model } = body;
+    if (!message || typeof message !== 'string') {
+      return res.status(400).json({ error: 'Field "message" wajib diisi.' });
+    }
+    try {
+      const title = await generateChatTitle({ userMessage: message, model: model || 'Solis 4.8' });
+      return res.status(200).json({ title });
+    } catch (err) {
+      return res.status(200).json({ title: message.slice(0, 40) });
+    }
+  }
+
+  const { message, model, reasoning, thinkingEnabled, webSearchEnabled, history, image, projectInstruction } = body;
   if (!message || typeof message !== 'string') {
     return res.status(400).json({ error: 'Field "message" wajib diisi.' });
   }
@@ -482,6 +554,8 @@ module.exports = async (req, res) => {
       thinkingEnabled: thinkingEnabled !== false,
       webSearchEnabled: !!webSearchEnabled,
       history: Array.isArray(history) ? history : [],
+      image: typeof image === 'string' ? image : null,
+      projectInstruction: typeof projectInstruction === 'string' && projectInstruction.trim() ? projectInstruction.trim() : null,
     });
   } catch (err) {
     console.error(err);
